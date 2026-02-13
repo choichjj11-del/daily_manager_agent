@@ -2,6 +2,7 @@
 """
 데일리 매니저 — Brian's Daily Manager Telegram Bot
 아침 다짐 검증 + 랜덤 진행 체크 + 저녁 리포트 + 스트릭 + 주간 회고
++ OpenAI 기반 자연어 대화 엔진
 """
 
 import os
@@ -14,6 +15,7 @@ from datetime import datetime, timedelta, time
 from pathlib import Path
 from io import BytesIO
 
+import httpx
 import pytz
 from telegram import Update, Bot
 from telegram.ext import (
@@ -260,8 +262,6 @@ def log_chat(role: str, message: str):
 # ─── Whisper API 호출 ───────────────────────────────────
 async def transcribe_voice(voice_bytes: bytes) -> str:
     """OpenAI Whisper API로 음성을 텍스트로 변환"""
-    import httpx
-
     if not OPENAI_API_KEY:
         log.warning("OPENAI_API_KEY가 설정되지 않아 Whisper를 사용할 수 없습니다.")
         return ""
@@ -287,11 +287,19 @@ class BotState:
         self.affirmation_retries = 0
         self.awaiting_revenue = False
         self.check_times: list[datetime] = []
+        self.conversation_history: list[dict] = []
+
+    def add_message(self, role: str, content: str):
+        """대화 히스토리에 메시지 추가 (최근 30개 유지)"""
+        self.conversation_history.append({"role": role, "content": content})
+        if len(self.conversation_history) > 30:
+            self.conversation_history = self.conversation_history[-30:]
 
     def reset_daily(self):
         self.awaiting_affirmation = False
         self.affirmation_retries = 0
         self.awaiting_revenue = False
+        self.conversation_history = []
         self.generate_check_times()
 
     def generate_check_times(self):
@@ -338,6 +346,410 @@ CHECK_MESSAGES_3 = [
 CHECK_POOLS = [CHECK_MESSAGES_1, CHECK_MESSAGES_2, CHECK_MESSAGES_3]
 
 
+# ─── OpenAI 대화 엔진 ──────────────────────────────────
+OPENAI_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "register_todos",
+            "description": "오늘 할 일을 등록합니다. 기존 목록에 추가됩니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "등록할 할 일 항목 목록",
+                    }
+                },
+                "required": ["items"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "complete_todo",
+            "description": "할 일을 완료 처리합니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {
+                        "type": "integer",
+                        "description": "완료할 미완료 항목 번호 (1부터 시작). keyword와 둘 중 하나만 사용.",
+                    },
+                    "keyword": {
+                        "type": "string",
+                        "description": "완료할 할 일에 포함된 키워드. index와 둘 중 하나만 사용.",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skip_todo",
+            "description": "할 일을 건너뛰거나 내일로 미룹니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {
+                        "type": "integer",
+                        "description": "건너뛸 미완료 항목 번호 (1부터 시작). keyword와 둘 중 하나만 사용.",
+                    },
+                    "keyword": {
+                        "type": "string",
+                        "description": "건너뛸 할 일에 포함된 키워드. index와 둘 중 하나만 사용.",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "record_revenue",
+            "description": "오늘의 수익을 기록합니다. 수익이 없으면 amount를 0으로.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amount": {
+                        "type": "integer",
+                        "description": "수익 금액 (원 단위). 예: 45만원 → 450000. 없으면 0.",
+                    }
+                },
+                "required": ["amount"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_status",
+            "description": "현재 할 일 현황, 수익 현황, 스트릭 정보를 조회합니다.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+]
+
+
+def build_system_prompt() -> str:
+    """현재 상태를 반영한 시스템 프롬프트 생성"""
+    todos = load_todos()
+    done = [t for t in todos if t["done"]]
+    undone = [t for t in todos if not t["done"]]
+
+    if todos:
+        todo_lines = []
+        undone_idx = 0
+        for t in todos:
+            if t["done"]:
+                todo_lines.append(f"  ✅ {t['text']}")
+            else:
+                undone_idx += 1
+                todo_lines.append(f"  ⬜ {undone_idx}. {t['text']}")
+        todos_text = "\n".join(todo_lines)
+    else:
+        todos_text = "  (등록된 할 일 없음)"
+
+    monthly_total, _ = get_monthly_revenue()
+    config = load_config()
+    target = config["monthly_revenue_target"]
+    pct = round(monthly_total / target * 100, 1) if target > 0 else 0
+
+    streaks = load_streaks()
+
+    now = now_kst()
+    if now.month < 12:
+        next_month = datetime(now.year, now.month + 1, 1, tzinfo=TZ)
+    else:
+        next_month = datetime(now.year + 1, 1, 1, tzinfo=TZ)
+    days_left = (next_month - now).days
+
+    weekday_names = ["월", "화", "수", "목", "금", "토", "일"]
+    weekday = weekday_names[now.weekday()]
+
+    context_parts = []
+    if state.awaiting_revenue:
+        context_parts.append(
+            "- 저녁 수익 보고를 기다리고 있습니다. "
+            "사용자가 수익 금액을 말하면 record_revenue 도구로 기록하세요. "
+            "'없음', '없어', '0' 등은 amount=0으로 기록하세요."
+        )
+    if state.awaiting_affirmation:
+        context_parts.append("- 아침 다짐 음성 메시지를 기다리는 중입니다.")
+    additional = "\n".join(context_parts) if context_parts else "- 일반 대화 모드"
+
+    return f"""너는 Brian의 데일리 매니저다.
+Brian이 600억 자산을 만들어가는 과정을 함께하는 참모이자 파트너다.
+
+말투:
+- 존댓말 기본. 딱딱한 비서가 아니라 같이 일하는 사람처럼 자연스럽게.
+- 간결하게. 텔레그램이라 한 메시지에 2~5문장이 적당.
+- 공감도 하고, 의견도 내고, 필요하면 솔직하게 말해도 된다.
+
+역할:
+- 할 일 관리: 등록, 완료, 건너뛰기 (도구 사용)
+- 수익 관리: 기록, 분석 (도구 사용)
+- 자연스러운 대화: 업무 논의, 전략 이야기, 고민 상담, 잡담 등
+- Brian이 맥락 없이 말해도 흐름을 읽고 적절히 대응
+- 진행 상황 체크에 대한 답변이 오면 격려하거나 피드백
+
+현재 상태:
+- 날짜: {today_str()} ({weekday})
+- 시각: {now.strftime('%H:%M')}
+- 오늘 할 일:
+{todos_text}
+  완료 {len(done)}개 / 미완료 {len(undone)}개
+- 이번 달 수익: {monthly_total:,}원 (목표 {target // 10000:,}만원 대비 {pct}%)
+- 남은 일수: {days_left}일
+- 스트릭:
+  아침 다짐: 연속 {streaks['affirmation']['current']}일 (최고 {streaks['affirmation']['best']}일)
+  할 일 완료: 연속 {streaks['todo_completion']['current']}일 (최고 {streaks['todo_completion']['best']}일)
+  수익 보고: 연속 {streaks['revenue_report']['current']}일 (최고 {streaks['revenue_report']['best']}일)
+
+현재 컨텍스트:
+{additional}
+
+도구 사용 규칙:
+- 할 일 등록/완료/건너뛰기/수익 기록 등 데이터 변경이 필요한 경우에만 도구 사용.
+- 금액 변환: "45만원" = 450000, "3만5천원" = 35000 등 원 단위로 변환해서 전달.
+- 일반 대화, 질문, 고민 상담 등은 도구 없이 자연스럽게 응답.
+- 여러 할 일을 한 번에 등록할 때는 register_todos 한 번에 items 배열로.
+- 완료 보고 시 어떤 항목인지 특정 가능하면 complete_todo 사용."""
+
+
+def execute_tool_call(fn_name: str, fn_args: dict) -> str:
+    """도구 호출 실행 후 결과 JSON 반환"""
+    try:
+        if fn_name == "register_todos":
+            items = fn_args["items"]
+            todos = load_todos()
+            for item in items:
+                todos.append({"text": item, "done": False})
+            save_todos(todos)
+            return json.dumps({
+                "success": True,
+                "registered": items,
+                "total_count": len(todos),
+            }, ensure_ascii=False)
+
+        elif fn_name == "complete_todo":
+            todos = load_todos()
+            incomplete = [(i, t) for i, t in enumerate(todos) if not t["done"]]
+            matched = None
+
+            if "index" in fn_args and fn_args["index"] is not None:
+                idx = fn_args["index"] - 1  # 1-based → 0-based
+                if 0 <= idx < len(incomplete):
+                    real_idx = incomplete[idx][0]
+                    todos[real_idx]["done"] = True
+                    matched = todos[real_idx]["text"]
+
+            if not matched and "keyword" in fn_args and fn_args["keyword"]:
+                keyword = fn_args["keyword"].lower()
+                for i, t in incomplete:
+                    if keyword in t["text"].lower():
+                        todos[i]["done"] = True
+                        matched = t["text"]
+                        break
+
+            if matched:
+                save_todos(todos)
+                remaining = [t for t in todos if not t["done"]]
+                return json.dumps({
+                    "success": True,
+                    "completed": matched,
+                    "remaining_count": len(remaining),
+                    "remaining": [t["text"] for t in remaining],
+                }, ensure_ascii=False)
+            else:
+                return json.dumps({
+                    "success": False,
+                    "error": "해당하는 할 일을 찾지 못했습니다.",
+                    "incomplete_items": [t["text"] for _, t in incomplete],
+                }, ensure_ascii=False)
+
+        elif fn_name == "skip_todo":
+            todos = load_todos()
+            incomplete = [(i, t) for i, t in enumerate(todos) if not t["done"]]
+            matched = None
+
+            if "index" in fn_args and fn_args["index"] is not None:
+                idx = fn_args["index"] - 1
+                if 0 <= idx < len(incomplete):
+                    matched = incomplete[idx][1]["text"]
+
+            if not matched and "keyword" in fn_args and fn_args["keyword"]:
+                keyword = fn_args["keyword"].lower()
+                for _, t in incomplete:
+                    if keyword in t["text"].lower():
+                        matched = t["text"]
+                        break
+
+            return json.dumps({
+                "success": matched is not None,
+                "skipped": matched or "해당하는 할 일을 찾지 못했습니다.",
+            }, ensure_ascii=False)
+
+        elif fn_name == "record_revenue":
+            amount = fn_args["amount"]
+            if amount == 0:
+                state.awaiting_revenue = False
+                update_streak("revenue_report", True)
+                return json.dumps({
+                    "success": True,
+                    "amount": 0,
+                    "message": "수익 없음으로 기록 완료",
+                }, ensure_ascii=False)
+            else:
+                state.awaiting_revenue = False
+                new_total, pct = add_revenue(amount)
+                update_streak("revenue_report", True)
+                config = load_config()
+                target = config["monthly_revenue_target"]
+                now = now_kst()
+                if now.month < 12:
+                    next_month = datetime(now.year, now.month + 1, 1, tzinfo=TZ)
+                else:
+                    next_month = datetime(now.year + 1, 1, 1, tzinfo=TZ)
+                days_left = (next_month - now).days
+                return json.dumps({
+                    "success": True,
+                    "amount": amount,
+                    "monthly_total": new_total,
+                    "target": target,
+                    "percentage": pct,
+                    "days_left": days_left,
+                }, ensure_ascii=False)
+
+        elif fn_name == "get_status":
+            todos = load_todos()
+            done = [t for t in todos if t["done"]]
+            undone = [t for t in todos if not t["done"]]
+            monthly_total, _ = get_monthly_revenue()
+            config = load_config()
+            target = config["monthly_revenue_target"]
+            pct = round(monthly_total / target * 100, 1) if target > 0 else 0
+            streaks = load_streaks()
+            return json.dumps({
+                "todos": {
+                    "done": [t["text"] for t in done],
+                    "undone": [t["text"] for t in undone],
+                },
+                "revenue": {
+                    "monthly_total": monthly_total,
+                    "target": target,
+                    "percentage": pct,
+                },
+                "streaks": streaks,
+            }, ensure_ascii=False)
+
+        else:
+            return json.dumps({"error": f"알 수 없는 도구: {fn_name}"}, ensure_ascii=False)
+
+    except Exception as e:
+        log.error(f"도구 실행 에러 ({fn_name}): {e}", exc_info=True)
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+async def call_openai_chat(user_message: str) -> str:
+    """OpenAI Chat API로 대화 응답 생성 (Function Calling 포함)"""
+    if not OPENAI_API_KEY:
+        return ""
+
+    system_prompt = build_system_prompt()
+    messages = [{"role": "system", "content": system_prompt}]
+
+    # 기존 대화 히스토리 추가
+    for msg in state.conversation_history:
+        messages.append(msg)
+
+    # 새 사용자 메시지 추가
+    messages.append({"role": "user", "content": user_message})
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            # 첫 번째 호출
+            resp = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": messages,
+                    "tools": OPENAI_TOOLS,
+                    "temperature": 0.7,
+                },
+            )
+
+            if resp.status_code != 200:
+                log.error(f"OpenAI Chat API 에러: {resp.status_code} {resp.text}")
+                return ""
+
+            data = resp.json()
+            choice = data["choices"][0]
+            message = choice["message"]
+
+            # 도구 호출 루프 (연속 호출 지원)
+            max_rounds = 5
+            rounds = 0
+            while message.get("tool_calls") and rounds < max_rounds:
+                rounds += 1
+                messages.append(message)
+
+                for tool_call in message["tool_calls"]:
+                    fn_name = tool_call["function"]["name"]
+                    fn_args = json.loads(tool_call["function"]["arguments"])
+                    log.info(f"도구 호출: {fn_name}({fn_args})")
+                    result = execute_tool_call(fn_name, fn_args)
+                    log.info(f"도구 결과: {result[:200]}")
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": result,
+                    })
+
+                # 도구 결과 포함 재호출
+                resp = await client.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": "gpt-4o-mini",
+                        "messages": messages,
+                        "tools": OPENAI_TOOLS,
+                        "temperature": 0.7,
+                    },
+                )
+
+                if resp.status_code != 200:
+                    log.error(f"OpenAI Chat API 에러 (도구 후): {resp.status_code} {resp.text}")
+                    return ""
+
+                data = resp.json()
+                choice = data["choices"][0]
+                message = choice["message"]
+
+            return message.get("content", "")
+
+    except httpx.TimeoutException:
+        log.error("OpenAI Chat API 타임아웃")
+        return ""
+    except Exception as e:
+        log.error(f"OpenAI Chat API 예외: {e}", exc_info=True)
+        return ""
+
+
 # ─── 스케줄 작업들 ──────────────────────────────────────
 async def send_affirmation(bot: Bot):
     """07:30 아침 다짐 발송"""
@@ -378,6 +790,8 @@ async def send_check_message(bot: Bot, check_index: int):
     msg = random.choice(pool).format(todo=todo)
 
     await bot.send_message(chat_id=CHAT_ID, text=msg)
+    # 봇이 보낸 체크 메시지도 대화 히스토리에 추가
+    state.add_message("assistant", msg)
     log_chat("봇", f"진행체크 {check_index + 1}차: {msg}")
     log.info(f"진행체크 {check_index + 1}차 발송")
 
@@ -414,6 +828,7 @@ async def send_evening_report(bot: Bot):
     )
     state.awaiting_revenue = True
     await bot.send_message(chat_id=CHAT_ID, text=msg)
+    state.add_message("assistant", msg)
     log_chat("봇", "저녁 리포트 발송")
     log.info("저녁 리포트 발송")
 
@@ -425,8 +840,6 @@ async def send_weekly_review(bot: Bot):
     target = config["monthly_revenue_target"]
     now = now_kst()
 
-    # 이번 주 할 일 데이터 — chat_history에서 집계
-    # 간단하게 스트릭 + 수익 데이터로 구성
     monthly_total, entries = get_monthly_revenue()
     week_revenue = 0
     week_start = (now - timedelta(days=7)).strftime("%m-%d")
@@ -435,9 +848,12 @@ async def send_weekly_review(bot: Bot):
             week_revenue += e["amount"]
 
     pct = round(monthly_total / target * 100, 1) if target > 0 else 0
-    days_left = (datetime(now.year, now.month + 1 if now.month < 12 else 1, 1, tzinfo=TZ) - now).days
+    if now.month < 12:
+        next_month = datetime(now.year, now.month + 1, 1, tzinfo=TZ)
+    else:
+        next_month = datetime(now.year + 1, 1, 1, tzinfo=TZ)
+    days_left = (next_month - now).days
 
-    # 완료율 코멘트
     aff_streak = streaks["affirmation"]["current"]
     todo_streak = streaks["todo_completion"]["current"]
 
@@ -463,13 +879,13 @@ async def send_weekly_review(bot: Bot):
         "수고 많으셨습니다."
     )
 
-    # 수익 질문도 같이
     state.awaiting_revenue = True
     await bot.send_message(chat_id=CHAT_ID, text=msg)
     await bot.send_message(
         chat_id=CHAT_ID,
         text="오늘 수익이 발생한 게 있으시면 금액을 알려주세요.\n없으시면 '없음'이라고 해주시면 됩니다.",
     )
+    state.add_message("assistant", msg)
     log_chat("봇", "주간 회고 발송")
     log.info("주간 회고 발송")
 
@@ -513,11 +929,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if s["current"] == s["best"] and s["current"] > 1:
             streak_msg += " 새로운 최고 기록입니다."
 
-        await update.message.reply_text(
+        reply = (
             f"확인했습니다. (일치율 {similarity:.0%}){streak_msg}\n"
             "오늘도 좋은 하루 시작하시죠.\n\n"
             "오늘 할 일이 있으시면 말씀해 주세요."
         )
+        await update.message.reply_text(reply)
+        state.add_message("assistant", reply)
         log_chat("봇", f"다짐 통과 ({similarity:.0%})")
     else:
         state.affirmation_retries += 1
@@ -526,35 +944,57 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if state.affirmation_retries >= max_retries:
             state.awaiting_affirmation = False
             update_streak("affirmation", False)
-            await update.message.reply_text(
+            reply = (
                 "노력해 주신 거 확인했습니다.\n"
                 "다짐 텍스트 다시 한번 눈으로 읽어보시고, 오늘도 시작하시죠.\n\n"
                 "오늘 할 일이 있으시면 말씀해 주세요."
             )
+            await update.message.reply_text(reply)
+            state.add_message("assistant", reply)
             log_chat("봇", f"다짐 3회 실패 — 강제 통과")
         else:
             remaining = max_retries - state.affirmation_retries
-            await update.message.reply_text(
+            reply = (
                 f"조금 더 정확하게 읽어주시면 좋겠습니다. (일치율 {similarity:.0%})\n"
                 f"한 번 더 부탁드리겠습니다. ({remaining}회 남음)"
             )
+            await update.message.reply_text(reply)
+            state.add_message("assistant", reply)
             log_chat("봇", f"다짐 재시도 요청 ({similarity:.0%})")
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """텍스트 메시지 처리"""
+    """텍스트 메시지 처리 — AI 대화 엔진"""
     if update.effective_chat.id != CHAT_ID:
         return
 
     text = update.message.text.strip()
     log_chat("Brian", text)
 
+    # OpenAI 대화 엔진으로 응답 생성
+    response = await call_openai_chat(text)
+
+    if response:
+        # 대화 히스토리에 추가
+        state.add_message("user", text)
+        state.add_message("assistant", response)
+
+        await update.message.reply_text(response)
+        log_chat("봇", response)
+    else:
+        # API 실패 시 폴백: 기존 키워드 매칭
+        log.warning("OpenAI API 실패 — 폴백 로직 사용")
+        await handle_text_fallback(update, text)
+
+
+async def handle_text_fallback(update: Update, text: str):
+    """OpenAI API 실패 시 폴백 — 기존 키워드 매칭 로직"""
+
     # ── 수익 응답 처리 ──
     if state.awaiting_revenue:
         if text in ("없음", "없어", "0", "없습니다"):
             state.awaiting_revenue = False
             update_streak("revenue_report", True)
-            streaks = load_streaks()
             await update.message.reply_text(
                 "확인했습니다. 내일 할 일이 있으시면 지금 말씀해 주세요.\n"
                 "아니면 내일 아침에 정리해 주셔도 됩니다.\n"
@@ -563,40 +1003,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             log_chat("봇", "수익: 없음")
             return
 
-        # 숫자 추출
         amount = extract_number(text)
         if amount is not None:
             state.awaiting_revenue = False
             new_total, pct = add_revenue(amount)
             update_streak("revenue_report", True)
-
             config = load_config()
             target = config["monthly_revenue_target"]
-            now = now_kst()
-            days_left = (datetime(now.year, now.month + 1 if now.month < 12 else 1, 1, tzinfo=TZ) - now).days
-
-            if pct >= 80:
-                comment = "목표에 거의 다 오셨습니다. 이 페이스 유지하시면 됩니다."
-            elif pct >= 50:
-                comment = "절반 이상 오셨습니다. 남은 기간 집중하시면 충분히 가능합니다."
-            elif pct >= 30:
-                comment = "조금 더 속도를 내셔야 할 것 같습니다. 내일 수익 파이프라인 우선 점검해보시죠."
-            else:
-                comment = "현재 페이스로는 목표 달성이 어렵습니다. 내일 전략 재점검이 필요할 것 같은데, 시간 내보시겠어요?"
-
             await update.message.reply_text(
-                f"확인했습니다.\n\n"
-                f"💰 이번 달 수익 현황:\n"
-                f"  오늘: {amount:,}원\n"
-                f"  이번 달 누적: {new_total:,}원\n"
-                f"  월 목표 {target // 10000:,}만원 대비: {pct}%\n"
-                f"  남은 일수: {days_left}일\n\n"
-                f"{comment}\n\n"
-                "내일 할 일이 있으시면 지금 말씀해 주세요.\n"
-                "아니면 내일 아침에 정리해 주셔도 됩니다.\n"
+                f"확인했습니다. {amount:,}원 기록했습니다.\n"
+                f"이번 달 누적: {new_total:,}원 (목표 대비 {pct}%)\n"
                 "수고하셨습니다."
             )
-            log_chat("봇", f"수익 기록: {amount:,}원 → 누적 {new_total:,}원 ({pct}%)")
+            log_chat("봇", f"수익 기록: {amount:,}원")
             return
 
     # ── 할 일 등록 ──
@@ -608,10 +1027,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 todos.append({"text": item, "done": False})
             save_todos(todos)
             items_text = "\n".join([f"  {i + 1}. {item}" for i, item in enumerate(items)])
-            await update.message.reply_text(
-                f"오늘 할 일 등록했습니다.\n{items_text}\n\n"
-                "순서대로 진행하시면 될까요, 아니면 우선순위 조정하실 건가요?"
-            )
+            await update.message.reply_text(f"할 일 등록했습니다.\n{items_text}")
             log_chat("봇", f"할 일 {len(items)}개 등록")
             return
 
@@ -622,9 +1038,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             todos = load_todos()
             todos.append({"text": item, "done": False})
             save_todos(todos)
-            await update.message.reply_text(
-                f"추가했습니다. 현재 할 일 {len(todos)}개입니다."
-            )
+            await update.message.reply_text(f"추가했습니다. 현재 할 일 {len(todos)}개입니다.")
             log_chat("봇", f"할 일 추가: {item}")
             return
 
@@ -633,7 +1047,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if any(k in text for k in done_keywords):
         todos = load_todos()
         matched = None
-        # 번호로 완료 ("1번 완료", "2번 했어")
         num_match = re.search(r"(\d+)\s*번", text)
         if num_match:
             idx = int(num_match.group(1)) - 1
@@ -643,11 +1056,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 todos[real_idx]["done"] = True
                 matched = todos[real_idx]["text"]
 
-        # 키워드 매칭
         if not matched:
             for t in todos:
                 if not t["done"]:
-                    # 할 일 텍스트의 단어가 메시지에 포함되어 있으면
                     words = t["text"].lower().split()
                     msg_lower = text.lower()
                     if any(w in msg_lower for w in words if len(w) > 1):
@@ -661,46 +1072,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if remaining:
                 remaining_text = ", ".join([t["text"] for t in remaining])
                 await update.message.reply_text(
-                    f"{matched} 완료 확인했습니다.\n"
-                    f"남은 할 일: {remaining_text}"
+                    f"{matched} 완료 확인했습니다.\n남은 할 일: {remaining_text}"
                 )
             else:
                 await update.message.reply_text(
-                    f"{matched} 완료 확인했습니다.\n"
-                    "오늘 할 일을 전부 완료하셨습니다! 수고하셨습니다."
+                    f"{matched} 완료 확인했습니다.\n오늘 할 일 전부 완료!"
                 )
             log_chat("봇", f"할 일 완료: {matched}")
             return
-
-    # ── 패스/안 할 거야 ──
-    if any(k in text for k in ("패스", "안 할", "안할", "넘길", "내일로")):
-        todos = load_todos()
-        for t in todos:
-            if not t["done"]:
-                # 첫 번째 미완료 항목을 내일로
-                await update.message.reply_text(
-                    f"알겠습니다. '{t['text']}' 항목은 내일로 이동하겠습니다."
-                )
-                log_chat("봇", f"내일로 이동: {t['text']}")
-                return
 
     # ── 할 일 목록 확인 ──
     if any(k in text for k in ("할 일 목록", "뭐 남았", "남은 거", "할일 뭐", "투두 목록")):
         todos = load_todos()
         if not todos:
-            await update.message.reply_text("등록된 할 일이 없습니다. 할 일을 알려주세요.")
+            await update.message.reply_text("등록된 할 일이 없습니다.")
         else:
             lines = []
             for i, t in enumerate(todos):
                 mark = "✅" if t["done"] else "⬜"
                 lines.append(f"  {mark} {i + 1}. {t['text']}")
-            await update.message.reply_text(
-                "📋 오늘 할 일:\n" + "\n".join(lines)
-            )
+            await update.message.reply_text("📋 오늘 할 일:\n" + "\n".join(lines))
         return
 
-    # ── 기타 메시지 (인식 안 됨) ──
-    # 아무 반응 안 함 — 불필요한 API 호출 방지
+    # ── 인식 안 되는 메시지 ──
+    await update.message.reply_text(
+        "죄송합니다. 지금 AI 대화 기능에 일시적인 문제가 있습니다.\n"
+        "할 일 등록은 '오늘 할 일: A, B, C' 형태로,\n"
+        "완료는 'A 했어' 형태로 말씀해 주세요."
+    )
 
 
 def extract_number(text: str) -> int | None:
@@ -724,11 +1123,9 @@ def extract_number(text: str) -> int | None:
 
 def parse_todo_items(text: str) -> list[str]:
     """할 일 텍스트 파싱"""
-    # "오늘 할 일: A, B, C" 또는 "할일: A, B, C"
     if ":" in text:
         text = text.split(":", 1)[1].strip()
 
-    # 콤마, 줄바꿈, "그리고" 등으로 분리
     items = re.split(r"[,\n]|그리고", text)
     return [item.strip() for item in items if item.strip()]
 
@@ -739,13 +1136,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "데일리 매니저 가동 중입니다.\n\n"
-        "사용 가능한 명령:\n"
-        "/status — 오늘 현황 확인\n"
+        "이제 자유롭게 대화하시면 됩니다.\n"
+        "할 일 등록, 완료 보고, 수익 기록, 현황 확인 등\n"
+        "편하게 말씀하시면 알아서 처리합니다.\n\n"
+        "명령어:\n"
+        "/status — 오늘 현황\n"
         "/streak — 스트릭 확인\n"
-        "/affirmation — 다짐 문구 확인\n\n"
-        "할 일 등록: '오늘 할 일: A, B, C'\n"
-        "할 일 완료: 'A 했어' 또는 '1번 완료'\n"
-        "할 일 추가: '추가: D'"
+        "/affirmation — 다짐 문구 확인"
     )
 
 
